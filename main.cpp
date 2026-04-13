@@ -1,114 +1,165 @@
 #include <iostream>
-#include <fstream>
-#include <random>
 #include <vector>
 #include <chrono>
-#include <iomanip>
 #include <cassert>
-
+#include <cstdint>
+#include <string>
 #include <sycl/sycl.hpp>
 #include "processImageData.h"
 #include "medianFilter.h"
 #include "medianFilterGPU.h"
-#include "medianFilterSIMD.h"
-//using namespace sycl;
 
+struct RgbChannels {
+    std::vector<uint8_t> red;
+    std::vector<uint8_t> green;
+    std::vector<uint8_t> blue;
 
+    explicit RgbChannels(size_t pixelCount)
+        : red(pixelCount), green(pixelCount), blue(pixelCount) {}
+};
 
-//сравнение результатов 2-ух фильтров
-bool compare_data(const uint8_t* A, const uint8_t* B, size_t size) {
-    for (size_t i = 0; i < size; ++i)
-        if (A[i] != B[i]) return false;
+bool buffers_equal(const uint8_t* left, const uint8_t* right, size_t size) {
+    for (size_t index = 0; index < size; ++index)
+        if (left[index] != right[index]) return false;
     return true;
 }
 
-//функция для "разогрева" GPU (инициализация очереди, выделение ресурсов, компиляция)
-void warmupGPU(sycl::queue q) {
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::range<1>(1), [=](sycl::id<1> idx) {});
-        });
-    q.wait();
+bool rgb_channels_equal(const RgbChannels& left, const RgbChannels& right) {
+    size_t pixelCount = left.red.size();
+    return buffers_equal(left.red.data(), right.red.data(), pixelCount)
+        && buffers_equal(left.green.data(), right.green.data(), pixelCount)
+        && buffers_equal(left.blue.data(), right.blue.data(), pixelCount);
 }
 
+void warmup_gpu(sycl::queue& queue) {
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) {});
+    });
+    queue.wait();
+}
 
+long elapsed_ms(std::chrono::high_resolution_clock::time_point startTime,
+                std::chrono::high_resolution_clock::time_point endTime) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+}
+
+long run_cpu_filter(const RgbChannels& inputChannels, RgbChannels& cpuOutput,
+                    int width, int height, int stride) {
+    auto startTime = std::chrono::high_resolution_clock::now();
+    MedianFilter::median_filter_3x3_rgb(
+        inputChannels.red.data(), inputChannels.green.data(), inputChannels.blue.data(),
+        cpuOutput.red.data(), cpuOutput.green.data(), cpuOutput.blue.data(),
+        width, height, stride);
+    auto endTime = std::chrono::high_resolution_clock::now();
+    return elapsed_ms(startTime, endTime);
+}
+
+long run_gpu_v1_filter(const RgbChannels& inputChannels, RgbChannels& gpuOutput,
+                       int width, int height, int stride, int iterations,
+                       sycl::queue& queue) {
+    MedianFilterGPU::median_filter_3x3_rgb_v1(
+        inputChannels.red.data(), inputChannels.green.data(), inputChannels.blue.data(),
+        gpuOutput.red.data(), gpuOutput.green.data(), gpuOutput.blue.data(),
+        width, height, stride, queue);
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+    for (int iteration = 0; iteration < iterations; iteration++) {
+        MedianFilterGPU::median_filter_3x3_rgb_v1(
+            inputChannels.red.data(), inputChannels.green.data(), inputChannels.blue.data(),
+            gpuOutput.red.data(), gpuOutput.green.data(), gpuOutput.blue.data(),
+            width, height, stride, queue);
+    }
+    auto endTime = std::chrono::high_resolution_clock::now();
+    return elapsed_ms(startTime, endTime) / iterations;
+}
+
+long run_gpu_v2_filter(const RgbChannels& inputChannels, RgbChannels& gpuOutput,
+                       int width, int height, int stride, int iterations,
+                       sycl::queue& queue) {
+    MedianFilterGPU::median_filter_3x3_rgb_v2(
+        inputChannels.red.data(), inputChannels.green.data(), inputChannels.blue.data(),
+        gpuOutput.red.data(), gpuOutput.green.data(), gpuOutput.blue.data(),
+        width, height, stride, queue);
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+    for (int iteration = 0; iteration < iterations; iteration++) {
+        MedianFilterGPU::median_filter_3x3_rgb_v2(
+            inputChannels.red.data(), inputChannels.green.data(), inputChannels.blue.data(),
+            gpuOutput.red.data(), gpuOutput.green.data(), gpuOutput.blue.data(),
+            width, height, stride, queue);
+    }
+    auto endTime = std::chrono::high_resolution_clock::now();
+    return elapsed_ms(startTime, endTime) / iterations;
+}
+
+void save_rgb_image(const std::string& outputFilename, int width, int height,
+                    const RgbChannels& outputChannels) {
+    BMP outputBMP;
+    create_BMP_rgb(outputBMP, width, height,
+                   outputChannels.red.data(),
+                   outputChannels.green.data(),
+                   outputChannels.blue.data());
+    outputBMP.WriteToFile(outputFilename.c_str());
+}
 
 int main() {
-    //-------------------------- ЗАШУМЛЕННОЕ ИЗОБРАЖЕНИЕ --------------------------
+    const int iterations = 100;
+    const std::string inputDirectory = "img/noise/";
+    const std::string outputDirectory = "img/filtered/";
+    const std::string imageFilename = "noisy_image.bmp";
 
     BMP inputBMP;
-    const int ITERATIONS = 1000;//количество повторений для нагрузки
+    std::string inputFilename = inputDirectory + imageFilename;
 
-    std::string inputfilepath = "img/noise/";
-    std::string filename = "impulse_5%_1.bmp";
-    //std::string filename = "gaussian_50.bmp";
-    inputBMP.ReadFromFile((inputfilepath + filename).c_str());
-
-    const int w = inputBMP.TellWidth();
-    const int h = inputBMP.TellHeight();
-    uint8_t* inputPixels = new uint8_t[w * h];
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            ebmpBYTE pixelID = inputBMP.GetPixel(x, y).Red;
-            inputPixels[y * w + x] = static_cast<uint8_t>(pixelID);
-        }
+    if (!inputBMP.ReadFromFile(inputFilename.c_str())) {
+        std::cerr << "Не удалось открыть файл: " << inputFilename << std::endl;
+        return 1;
     }
 
-    //-------------------------- ФИЛЬТРАЦИЯ + ЗАМЕРЫ --------------------------
+    const int width = inputBMP.TellWidth();
+    const int height = inputBMP.TellHeight();
+    const int stride = width;
+    const size_t pixelCount = (size_t)width * height;
 
+    std::cout << "Изображение: " << width << " x " << height << " px" << std::endl;
 
+    RgbChannels inputChannels(pixelCount);
+    RgbChannels cpuOutput(pixelCount);
+    RgbChannels gpuV1Output(pixelCount);
+    RgbChannels gpuV2Output(pixelCount);
 
-    //ОДНОПОТОЧНАЯ ВЕРСИЯ
-    uint8_t* outputPixels = new uint8_t[w * h];
+    load_rgb_from_bmp(inputBMP, inputChannels.red.data(), inputChannels.green.data(), inputChannels.blue.data());
 
-    auto start1 = std::chrono::high_resolution_clock::now();
-    MedianFilter::median_filter_3x3(inputPixels, outputPixels, w, h, w);
-    auto end1 = std::chrono::high_resolution_clock::now();
-    auto duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(end1 - start1);
-    std::cout << "Single thread version: " << duration1.count() << " ms" << std::endl;
+    long cpuTimeMs = run_cpu_filter(inputChannels, cpuOutput, width, height, stride);
+    std::cout << "Single thread:  " << cpuTimeMs << " ms" << std::endl;
 
+    sycl::queue queue;
+    std::cout << "GPU: " << queue.get_device().get_info<sycl::info::device::name>() << std::endl;
+    warmup_gpu(queue);
 
-    //GPU ВЕРСИЯ
+    long gpuV1TimeMs = run_gpu_v1_filter(inputChannels, gpuV1Output,
+                                         width, height, stride, iterations, queue);
+    std::cout << "GPU v1 (naive): " << gpuV1TimeMs
+              << " ms (среднее за " << iterations << " итераций)" << std::endl;
 
-    //warmup
-    sycl::queue q;
-    warmupGPU(q);
+    long gpuV2TimeMs = run_gpu_v2_filter(inputChannels, gpuV2Output,
+                                         width, height, stride, iterations, queue);
+    std::cout << "GPU v2 (shared): " << gpuV2TimeMs
+              << " ms (среднее за " << iterations << " итераций)" << std::endl;
 
-    //base version (GPU)
-    uint8_t* outputPixels_gpu = new uint8_t[w * h];
+    bool gpuV1IsCorrect = rgb_channels_equal(cpuOutput, gpuV1Output);
+    bool gpuV2IsCorrect = rgb_channels_equal(cpuOutput, gpuV2Output);
 
-    auto start2 = std::chrono::high_resolution_clock::now();
-    for (size_t i = 0; i < ITERATIONS; i++) {
-        MedianFilterGPU::median_filter_3x3_v1(inputPixels, outputPixels_gpu, w, h, w, q);
-    }
-    auto end2 = std::chrono::high_resolution_clock::now();
-    auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(end2 - start2);
-    std::cout << "GPU version v1: " << duration2.count() << " ms" << std::endl;
+    std::cout << "\nПроверка корректности:" << std::endl;
+    std::cout << "  CPU == GPU v1: " << (gpuV1IsCorrect ? "OK" : "FAILED") << std::endl;
+    std::cout << "  CPU == GPU v2: " << (gpuV2IsCorrect ? "OK" : "FAILED") << std::endl;
 
-    //tiled version (GPU)
-    uint8_t* outputPixels_gpu_v2 = new uint8_t[w * h];
+    assert(gpuV1IsCorrect && "GPU v1 дал неверный результат!");
+    assert(gpuV2IsCorrect && "GPU v2 дал неверный результат!");
 
-    auto start3 = std::chrono::high_resolution_clock::now();
-    for (size_t i = 0; i < ITERATIONS; i++) {
-        MedianFilterGPU::median_filter_3x3_v2(inputPixels, outputPixels_gpu_v2, w, h, w, q);
-    }
-    auto end3 = std::chrono::high_resolution_clock::now();
-    auto duration3 = std::chrono::duration_cast<std::chrono::milliseconds>(end3 - start3);
-    std::cout << "GPU version v2: " << duration3.count() << " ms" << std::endl;
+    std::string outputFilename = outputDirectory + "filtered_" + imageFilename;
+    save_rgb_image(outputFilename, width, height, gpuV2Output);
+    std::cout << "\nОтфильтрованное изображение сохранено: " << outputFilename << std::endl;
 
-    //-------------------------- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ --------------------------
-
-    //создаем отфильтрованное изображение (GPU)
-    //BMP outputBMP;
-    //create_BMP_grayscale(inputBMP, outputBMP, outputPixels_gpu);
-    //std::string outputfilepath = "img/filtered/";
-    //std::string prefix = "filtered_";
-    //outputBMP.WriteToFile((outputfilepath + prefix + filename).c_str());
-
-    //-------------------------- ПРОВЕРКА --------------------------
-
-    assert(compare_data(outputPixels, outputPixels_gpu, w * h));
-    assert(compare_data(outputPixels, outputPixels_gpu_v2, w * h));
-
-    std::cout << "Processing complete!" << std::endl;
     return 0;
 }

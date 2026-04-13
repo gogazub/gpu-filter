@@ -1,0 +1,11 @@
+.gitignore
+.codex
+.codex/
+median_filter
+median_filter.exe
+*.obj
+*.pdb
+*.o
+*.out
+img/filtered/*
+!img/filtered/.gitkeep
